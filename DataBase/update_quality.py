@@ -1,19 +1,19 @@
 """
-Parse a quality dump from the Isaac debug log and update the Quality column
-in Passive_Item and Activ_Item tables in Supabase.
+Parse un quality dump du log debug d'Isaac et peuple les catalogues d'items
+(Name + Quality) dans Supabase via upsert.
 
 Usage:
     python DataBase/update_quality.py [log_path]
 
-The log must contain a block delimited by:
+Le log doit contenir un bloc délimité par :
     [QualityDump:START] ... [QualityDump:END]
-with lines of the form:
+avec des lignes de la forme :
     [QualityDump] id=<n> quality=<0-4> type=<n> name=<...>
 
-Item types in Isaac:
-    1 = Passive collectible  → Passive_Item
-    3 = Active collectible   → Activ_Item
-    4 = Familiar (passive)   → Passive_Item
+Types d'items Isaac :
+    1 = Passif (collectible)  → PassiveItem
+    3 = Actif  (collectible)  → ActiveItem
+    4 = Familier (passif)     → PassiveItem
 """
 
 import os
@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from supabase import create_client, Client
 
-# Load .env
+# Charger .env
 env_path = Path(__file__).parent.parent / ".env"
 if env_path.exists():
     with open(env_path) as f:
@@ -35,12 +35,15 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 DEFAULT_LOG_PATHS = [
-    Path.home()
-    / "~/Library/Containers/com.isaacmarovitz.Whisky/Bottles/DBAA9250-ABEB-4E4F-A8A9-88D75693B4D4/drive_c/users/crossover/Documents/My\ Games/Binding\ of\ Isaac\ Repentance/log.txt",
+    Path(
+        "~/Library/Containers/com.isaacmarovitz.Whisky/Bottles/"
+        "DBAA9250-ABEB-4E4F-A8A9-88D75693B4D4/drive_c/users/crossover/Documents/"
+        "My Games/Binding of Isaac Repentance/log.txt"
+    ).expanduser(),
     Path.home() / "Documents/My Games/Binding of Isaac Repentance/log.txt",
 ]
 
-LINE_RE = re.compile(r"\[QualityDump\] id=(\d+) quality=(\d+) type=(\d+)")
+LINE_RE = re.compile(r"\[QualityDump\] id=(\d+) quality=(\d+) type=(\d+) name=(.*)")
 
 
 def find_log_path(override=None):
@@ -56,16 +59,13 @@ def find_log_path(override=None):
 
 
 def parse_dump(log_path):
-    """Extract id→(quality, type) from the last QualityDump block in the log."""
+    """Extrait id→(quality, type, name) du dernier bloc QualityDump du log."""
     text = log_path.read_text(encoding="utf-8", errors="replace")
 
-    # Find the last complete dump block
     start = text.rfind("[QualityDump:START]")
     end = text.rfind("[QualityDump:END]")
     if start == -1 or end == -1 or end < start:
-        sys.exit(
-            "No complete [QualityDump:START]...[QualityDump:END] block found in log."
-        )
+        sys.exit("No complete [QualityDump:START]...[QualityDump:END] block found in log.")
 
     block = text[start:end]
     items = {}
@@ -73,45 +73,31 @@ def parse_dump(log_path):
         item_id = int(m.group(1))
         quality = int(m.group(2))
         item_type = int(m.group(3))
-        items[item_id] = (quality, item_type)
+        name = m.group(4).strip()
+        items[item_id] = (quality, item_type, name)
 
     print(f"Parsed {len(items)} items from quality dump.")
     return items
 
 
 def update_qualities(items: dict, supabase: Client):
-    passive_updates = 0
-    active_updates = 0
-    skipped = 0
+    passive_rows, active_rows, skipped = [], [], 0
 
-    for item_id, (quality, item_type) in items.items():
-        # type 1 = passive, type 4 = familiar (also in Passive_Item)
+    for item_id, (quality, item_type, name) in items.items():
+        row = {"id": item_id, "Name": name or None, "Quality": quality}
         if item_type in (1, 4):
-            table = "Passive_Item"
+            passive_rows.append(row)
         elif item_type == 3:
-            table = "Activ_Item"
+            active_rows.append(row)
         else:
             skipped += 1
-            continue
 
-        try:
-            result = (
-                supabase.table(table)
-                .update({"Quality": quality})
-                .eq("id", item_id)
-                .execute()
-            )
-            if result.data:
-                if table == "Passive_Item":
-                    passive_updates += 1
-                else:
-                    active_updates += 1
-        except Exception as e:
-            print(f"  ✗ Failed to update {table} id={item_id}: {e}")
+    if passive_rows:
+        supabase.table("PassiveItem").upsert(passive_rows).execute()
+    if active_rows:
+        supabase.table("ActiveItem").upsert(active_rows).execute()
 
-    print(
-        f"\n✓ Updated {passive_updates} passive items, {active_updates} active items."
-    )
+    print(f"\n✓ Upserted {len(passive_rows)} passive items, {len(active_rows)} active items.")
     if skipped:
         print(f"  Skipped {skipped} items with unrecognised type.")
 

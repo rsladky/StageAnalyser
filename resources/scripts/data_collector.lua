@@ -1,5 +1,35 @@
 local DataCollector = {}
 
+local json = require("json")
+local Uploader = require("resources.scripts.uploader")
+
+-- Id de contributeur persistant (distingue les runs des différents joueurs du mod)
+DataCollector.contributorId = nil
+
+-- Récupère (ou génère + persiste) un id de contributeur via les mod data.
+function DataCollector:GetContributorId()
+	if self.contributorId then
+		return self.contributorId
+	end
+
+	-- Tenter de relire la config persistée
+	if Isaac.HasModData(StageAnalyser) then
+		local raw = Isaac.LoadModData(StageAnalyser)
+		local ok, cfg = pcall(json.decode, raw)
+		if ok and type(cfg) == "table" and cfg.contributorId then
+			self.contributorId = cfg.contributorId
+			return self.contributorId
+		end
+	end
+
+	-- Générer un nouvel id et le persister
+	local newId = string.format("contrib_%08x%08x", Random(), Random())
+	self.contributorId = newId
+	Isaac.SaveModData(StageAnalyser, json.encode({ contributorId = newId }))
+	Isaac.DebugString("[DataCollector] New contributor id: " .. newId)
+	return newId
+end
+
 -- Structure pour stocker toutes les données de la run
 DataCollector.runData = {
 	runID = nil,
@@ -20,9 +50,11 @@ function DataCollector:InitRun()
 	local timestamp = Isaac.GetFrameCount()
 	self.runData = {
 		runID = timestamp,
+		playerId = self:GetContributorId(),
 		seed = seeds:GetStartSeedString(),
 		startTime = timestamp,
 		character = player:GetPlayerType(),
+		difficulty = game.Difficulty,
 		floors = {},
 		currentFloor = nil,
 		isActive = true,
@@ -42,6 +74,7 @@ function DataCollector:InitFloor()
 		stageNumber = level:GetStage(),
 		stageType = level:GetStageType(),
 		stageName = self:GetStageName(level:GetStage(), level:GetStageType()),
+		curses = level:GetCurses(),
 		rooms = {},
 		playerStates = {},
 	}
@@ -334,22 +367,18 @@ end
 
 -- Sauvegarder les données dans un fichier JSON
 function DataCollector:SaveToFile()
-	local json = require("json")
-	local filename = "stageanalyser_" .. self.runData.runID .. ".json"
-
-	Isaac.DebugString("[DataCollector] Saving run data to: " .. filename)
-
 	-- Remove currentFloor reference before encoding to avoid duplicating the last floor
 	self.runData.currentFloor = nil
+	-- Ne pas sérialiser le flag interne
+	self.runData.isActive = nil
 
 	-- Convertir en JSON
 	local jsonData = json.encode(self.runData)
 
-	-- Note: Isaac ne permet pas d'écrire directement dans des fichiers
-	-- Il faut utiliser Isaac.SaveModData ou exporter via la console debug
-	Isaac.SaveModData(StageAnalyser, jsonData)
+	-- Upload direct vers Supabase (nécessite --luadebug ; sinon no-op)
+	Uploader.Upload(jsonData)
 
-	-- Balises pour extraction via le log (push_from_log.py)
+	-- Fallback : balises pour extraction via le log (push_from_log.py)
 	Isaac.DebugString("[StageAnalyserJSON]" .. jsonData .. "[/StageAnalyserJSON]")
 	Isaac.DebugString("[DataCollector] JSON Data logged for external export")
 end
